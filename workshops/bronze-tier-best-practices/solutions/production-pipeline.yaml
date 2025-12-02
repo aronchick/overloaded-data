@@ -1,0 +1,310 @@
+# =============================================================================
+# PRODUCTION PIPELINE: All 10 Fixes Combined
+# =============================================================================
+# This pipeline demonstrates a production-ready bronze tier ingestion with
+# all data quality best practices applied.
+#
+# FIXES APPLIED:
+#   1. Event IDs        - UUID v4 for every event
+#   2. Timestamps       - Normalized to ISO 8601 UTC
+#   3. Deduplication    - Cache-based duplicate removal
+#   4. PII Masking      - Hash/mask all sensitive fields
+#   5. Schema Validation - Required fields and type checking
+#   6. Test Filtering   - Remove non-production data
+#   7. Batching         - Efficient grouped writes
+#   8. Rate Limiting    - Controlled throughput
+#   9. Error Handling   - Try/catch with DLQ routing
+#  10. Multi-Output     - Fan-out to multiple destinations
+#
+# Run: expanso-edge run -c production-pipeline.yaml
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# RESOURCES: Caches, Rate Limiters, and Reusable Components
+# -----------------------------------------------------------------------------
+cache_resources:
+  # Deduplication cache with 10-minute window
+  - label: dedup_cache
+    memory:
+      default_ttl: 10m
+      # cap: 1000000  # Optional: limit entries
+
+rate_limit_resources:
+  # Global throughput control: 500 events/second
+  - label: global_rate_limiter
+    local:
+      count: 500
+      interval: 1s
+
+# -----------------------------------------------------------------------------
+# INPUT: High-volume data generator (simulating real-world messy data)
+# -----------------------------------------------------------------------------
+input:
+  generate:
+    count: 1000  # Generate 1000 events for demo (0 = infinite)
+    interval: 10ms
+
+# -----------------------------------------------------------------------------
+# PIPELINE: Processing chain with all 10 fixes
+# -----------------------------------------------------------------------------
+pipeline:
+  processors:
+    # =========================================================================
+    # STAGE 0: Generate messy raw data (simulating upstream sources)
+    # =========================================================================
+    - mapping: |
+        # Weak/missing ID
+        root.id = if random_int(min: 0, max: 10) > 3 {
+          "evt-" + random_int(min: 1, max: 100).string()
+        } else { null }
+
+        # Mixed timestamp formats
+        let ts_type = random_int(min: 0, max: 4)
+        root.timestamp = match $ts_type {
+          0 => now(),
+          1 => timestamp_unix(),
+          2 => timestamp_unix_milli(),
+          3 => null,
+          _ => "2024-12-01 14:30:00"
+        }
+
+        # PII in plain text
+        root.user = {
+          "name": fake("name"),
+          "email": fake("email"),
+          "phone": fake("phone_number"),
+          "ssn": "123-45-" + random_int(min: 1000, max: 9999).string()
+        }
+
+        # Schema issues
+        let schema_issue = random_int(min: 0, max: 10)
+        root.event_type = if schema_issue > 2 {
+          ["page_view", "click", "purchase"][random_int(min: 0, max: 2)]
+        } else { null }
+
+        root.amount = if schema_issue > 3 {
+          random_int(min: 1, max: 10000)
+        } else if schema_issue == 0 {
+          "not-a-number"
+        } else { -100 }
+
+        # Test data mixed in
+        let is_test = random_int(min: 0, max: 10) < 2
+        root.environment = if is_test { "test" } else { "production" }
+        root.debug = is_test
+        root.test_user = is_test
+
+    # =========================================================================
+    # FIX 9: WRAP EVERYTHING IN TRY/CATCH FOR ERROR HANDLING
+    # =========================================================================
+    - try:
+        # =====================================================================
+        # FIX 1: ADD PROPER EVENT IDS
+        # =====================================================================
+        - mapping: |
+            root = this
+            root.original_id = this.id  # Preserve for debugging
+            root.id = uuid_v4()         # Always assign UUID
+
+        # =====================================================================
+        # FIX 2: NORMALIZE TIMESTAMPS
+        # =====================================================================
+        - mapping: |
+            root = this
+            root.original_timestamp = this.timestamp
+
+            root.timestamp = match {
+              this.timestamp.type() == "string" && this.timestamp.contains("T") =>
+                this.timestamp.ts_parse("2006-01-02T15:04:05Z07:00")
+                  .catch(now())
+                  .ts_format("2006-01-02T15:04:05Z"),
+
+              this.timestamp.type() == "string" =>
+                this.timestamp.ts_parse("2006-01-02 15:04:05")
+                  .catch(now())
+                  .ts_format("2006-01-02T15:04:05Z"),
+
+              this.timestamp.type() == "number" && this.timestamp < 10000000000 =>
+                this.timestamp.ts_unix().ts_format("2006-01-02T15:04:05Z"),
+
+              this.timestamp.type() == "number" =>
+                this.timestamp.ts_unix_milli().ts_format("2006-01-02T15:04:05Z"),
+
+              _ => now()
+            }
+
+        # =====================================================================
+        # FIX 6: FILTER TEST DATA
+        # =====================================================================
+        - mapping: |
+            let is_test = this.environment != "production" ||
+                          this.debug == true ||
+                          this.test_user == true ||
+                          this.user.email.lowercase().contains("test") ||
+                          this.user.email.lowercase().contains("@example.com")
+
+            root = if $is_test {
+              deleted()
+            } else {
+              this.without("debug", "test_user", "original_id", "original_timestamp")
+            }
+
+        # =====================================================================
+        # FIX 5: VALIDATE SCHEMA
+        # =====================================================================
+        - mapping: |
+            let errors = []
+
+            # Required fields
+            let errors = if this.id == null { $errors.append("missing: id") } else { $errors }
+            let errors = if this.timestamp == null { $errors.append("missing: timestamp") } else { $errors }
+            let errors = if this.event_type == null { $errors.append("missing: event_type") } else { $errors }
+            let errors = if this.user == null { $errors.append("missing: user") } else { $errors }
+            let errors = if this.user != null && this.user.email == null { $errors.append("missing: user.email") } else { $errors }
+
+            # Type validation
+            let errors = if this.amount != null && this.amount.type() != "number" {
+              $errors.append("invalid type: amount")
+            } else { $errors }
+
+            # Range validation
+            let errors = if this.amount != null && this.amount.type() == "number" && this.amount < 0 {
+              $errors.append("invalid range: amount < 0")
+            } else { $errors }
+
+            # Enum validation
+            let valid_types = ["page_view", "click", "purchase", "signup", "logout"]
+            let errors = if this.event_type != null && !$valid_types.contains(this.event_type) {
+              $errors.append("invalid enum: event_type")
+            } else { $errors }
+
+            # Fail if any errors
+            root = if $errors.length() > 0 {
+              throw("validation failed: " + $errors.join(", "))
+            } else {
+              this
+            }
+
+        # =====================================================================
+        # FIX 4: MASK PII
+        # =====================================================================
+        - mapping: |
+            root = this
+            root.user = {
+              "email_hash": this.user.email.lowercase().hash("sha256"),
+              "email_domain": this.user.email.split("@").index(1).or("unknown"),
+              "phone_masked": "***-***-" + this.user.phone.slice(-4).or("0000"),
+              "ssn_masked": "***-**-" + this.user.ssn.slice(-4).or("0000")
+            }
+
+        # =====================================================================
+        # FIX 3: DEDUPLICATE
+        # =====================================================================
+        - dedupe:
+            cache: dedup_cache
+            key: ${! json("id") }
+
+        # =====================================================================
+        # FIX 8: RATE LIMIT
+        # =====================================================================
+        - rate_limit:
+            resource: global_rate_limiter
+
+        # =====================================================================
+        # ADD METADATA
+        # =====================================================================
+        - mapping: |
+            root = this
+            root._metadata = {
+              "ingested_at": now(),
+              "pipeline_version": "1.0.0",
+              "environment": this.environment
+            }
+            root = this.without("environment")
+
+    # =========================================================================
+    # FIX 9: CATCH ERRORS - Route to DLQ
+    # =========================================================================
+    - catch:
+        - log:
+            level: ERROR
+            message: "Processing failed: ${! error() } for event ${! json(\"id\").or(\"unknown\") }"
+
+        - mapping: |
+            root = {
+              "original_event": this,
+              "error": {
+                "message": error(),
+                "failed_at": now(),
+                "pipeline": "bronze-tier-production"
+              }
+            }
+
+        # In production: route to DLQ output
+        # For demo: just log and delete
+        - log:
+            level: WARN
+            message: "DLQ: ${! content() }"
+
+        - mapping: root = deleted()
+
+# -----------------------------------------------------------------------------
+# OUTPUT: FIX 7 (BATCHING) + FIX 10 (MULTI-OUTPUT FAN-OUT)
+# -----------------------------------------------------------------------------
+output:
+  broker:
+    pattern: fan_out
+    outputs:
+      # PRIMARY: Real-time stream (stdout for demo)
+      - stdout:
+          codec: lines
+          batching:
+            count: 50
+            period: 5s
+
+      # SECONDARY: Archive file (simulating S3)
+      - file:
+          path: /tmp/bronze-tier-${! timestamp_unix() }.jsonl
+          codec: lines
+          batching:
+            count: 100
+            period: 10s
+
+# =============================================================================
+# PRODUCTION S3/KAFKA CONFIGURATION (Uncomment for real deployment)
+# =============================================================================
+# output:
+#   broker:
+#     pattern: fan_out
+#     outputs:
+#       # Hot path: Kafka for real-time consumers
+#       - kafka:
+#           addresses: ["${KAFKA_BROKERS}"]
+#           topic: bronze-events
+#           key: ${! json("id") }
+#           batching:
+#             count: 500
+#             period: 5s
+#
+#       # Cold path: S3 for analytics/archive
+#       - aws_s3:
+#           bucket: "${S3_BUCKET}"
+#           path: "bronze/${! now().ts_format(\"2006/01/02/15\") }/${! uuid_v4() }.json.gz"
+#           batching:
+#             count: 1000
+#             period: 60s
+#             byte_size: 10485760
+#           processors:
+#             - archive:
+#                 format: json_array
+#             - compress:
+#                 algorithm: gzip
+#
+#       # DLQ: Separate bucket for failed events
+#       - switch:
+#           cases:
+#             - check: this.error != null
+#               output:
+#                 aws_s3:
+#                   bucket: "${S3_BUCKET}-dlq"
+#                   path: "errors/${! now().ts_format(\"2006/01/02\") }/${! uuid_v4() }.json"

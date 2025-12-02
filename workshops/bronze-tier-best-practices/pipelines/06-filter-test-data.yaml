@@ -1,0 +1,97 @@
+# =============================================================================
+# Module 6: Filter Test Data
+# =============================================================================
+# FIX: Remove test/debug data from production pipeline
+#
+# BEFORE: Test users, debug flags, synthetic data polluting analytics
+# AFTER:  Only production data flows to bronze tier
+#
+# Common test data indicators:
+#   - environment: "test", "staging", "dev"
+#   - debug: true
+#   - test_user: true
+#   - email containing "test", "@example.com"
+#   - User IDs in test ranges
+#
+# Run: expanso-edge run -c 06-filter-test-data.yaml
+# =============================================================================
+
+input:
+  generate:
+    count: 100
+    interval: 50ms
+
+pipeline:
+  processors:
+    # Generate mixed test and production data
+    - mapping: |
+        root.id = uuid_v4()
+        root.timestamp = now()
+
+        let is_test = random_int(min: 0, max: 10) < 3  # 30% test data
+        root.environment = if is_test { "test" } else { "production" }
+        root.debug = if is_test { true } else { false }
+
+        # Test users often have specific patterns
+        root.user = if is_test {
+          {
+            "email": "test" + random_int(min: 1, max: 100).string() + "@example.com",
+            "name": "Test User " + random_int(min: 1, max: 100).string(),
+            "is_test_account": true
+          }
+        } else {
+          {
+            "email": fake("email"),
+            "name": fake("name"),
+            "is_test_account": false
+          }
+        }
+
+        root.event_type = ["page_view", "click", "purchase"][random_int(min: 0, max: 2)]
+        root.amount = random_int(min: 1, max: 10000)
+
+    # ===========================================
+    # FIX 6: Filter out test data
+    # ===========================================
+    - mapping: |
+        # Check all test indicators
+        let is_test_env = this.environment != "production"
+        let has_debug_flag = this.debug == true
+        let is_test_account = this.user.is_test_account == true
+
+        # Check email patterns
+        let email_lower = this.user.email.lowercase()
+        let is_test_email = $email_lower.contains("test") ||
+                            $email_lower.contains("@example.com") ||
+                            $email_lower.contains("@test.") ||
+                            $email_lower.contains("+test")
+
+        # Combine all checks
+        let should_filter = $is_test_env || $has_debug_flag || $is_test_account || $is_test_email
+
+        # Add filter metadata before potentially deleting
+        root = this
+        root._filter = {
+          "is_test_env": $is_test_env,
+          "has_debug_flag": $has_debug_flag,
+          "is_test_account": $is_test_account,
+          "is_test_email": $is_test_email,
+          "filtered": $should_filter
+        }
+
+    # Log filtered records for debugging (optional)
+    - switch:
+        - check: this._filter.filtered == true
+          processors:
+            - log:
+                level: DEBUG
+                message: "Filtering test data: ${! json(\"id\") } - ${! json(\"_filter\") }"
+            - mapping: root = deleted()
+
+    # Clean up filter metadata for production records
+    - mapping: |
+        root = this.without("_filter")
+
+output:
+  stdout:
+    codec: lines

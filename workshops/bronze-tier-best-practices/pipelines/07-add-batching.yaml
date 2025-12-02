@@ -1,0 +1,109 @@
+# =============================================================================
+# Module 7: Add Batching
+# =============================================================================
+# FIX: Batch records before writing to storage
+#
+# BEFORE: Writing one record at a time (high I/O, slow, expensive)
+# AFTER:  Batch records by count, size, or time window
+#
+# Batching benefits:
+#   - Reduced I/O operations and connection overhead
+#   - Better compression ratios
+#   - Lower cloud storage costs (fewer PUT requests)
+#   - Improved throughput
+#
+# Batching strategies:
+#   - count: Flush after N messages
+#   - byte_size: Flush after X bytes
+#   - period: Flush every T seconds
+#   - Combination: Whichever comes first
+#
+# Run: expanso-edge run -c 07-add-batching.yaml
+# =============================================================================
+
+input:
+  generate:
+    count: 500  # Generate more to see batching in action
+    interval: 10ms
+
+pipeline:
+  processors:
+    # Generate sample data
+    - mapping: |
+        root.id = uuid_v4()
+        root.timestamp = now()
+        root.user = { "email_hash": fake("email").hash("sha256") }
+        root.event_type = ["page_view", "click", "purchase"][random_int(min: 0, max: 2)]
+        root.amount = random_int(min: 1, max: 10000)
+        root.payload = {
+          "session_id": ksuid(),
+          "page": "/products/" + random_int(min: 1, max: 100).string(),
+          "referrer": "https://example.com"
+        }
+
+# ===========================================
+# FIX 7: Add batching to output
+# ===========================================
+output:
+  # Batch before writing
+  # This groups individual messages into arrays
+
+  # Option 1: Batch to stdout (for demo)
+  stdout:
+    codec: lines
+    batching:
+      count: 50       # Flush every 50 messages
+      period: 5s      # OR flush every 5 seconds (whichever first)
+      # byte_size: 1048576  # OR flush at 1MB
+
+      # Optional: Process batch before output
+      processors:
+        # Archive the batch as JSON array
+        - archive:
+            format: json_array
+
+        # Add batch metadata
+        - mapping: |
+            root = {
+              "batch_id": uuid_v4(),
+              "batch_size": this.length(),
+              "batched_at": now(),
+              "records": this
+            }
+
+  # ===========================================
+  # Production example: S3 with batching
+  # ===========================================
+  # aws_s3:
+  #   bucket: my-bronze-tier
+  #   path: "events/${! timestamp_unix() }_${! uuid_v4() }.json"
+  #   batching:
+  #     count: 1000           # 1000 records per file
+  #     period: 60s           # OR every minute
+  #     byte_size: 10485760   # OR 10MB
+  #     processors:
+  #       - archive:
+  #           format: json_array
+  #       - compress:
+  #           algorithm: gzip
+
+  # ===========================================
+  # Production example: Database with batching
+  # ===========================================
+  # sql_insert:
+  #   driver: postgres
+  #   dsn: ${DB_DSN}
+  #   table: events
+  #   columns: [id, timestamp, event_type, amount, payload]
+  #   args_mapping: |
+  #     root = [
+  #       this.id,
+  #       this.timestamp,
+  #       this.event_type,
+  #       this.amount,
+  #       this.payload.format_json()
+  #     ]
+  #   max_in_flight: 64
+  #   batching:
+  #     count: 500
+  #     period: 10s

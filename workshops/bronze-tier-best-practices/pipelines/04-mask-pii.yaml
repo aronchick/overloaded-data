@@ -1,0 +1,91 @@
+# =============================================================================
+# Module 4: Mask PII (Personally Identifiable Information)
+# =============================================================================
+# FIX: Hash or mask sensitive data before storage
+#
+# BEFORE: Plain text emails, SSNs, phone numbers, IP addresses
+# AFTER:  Hashed/masked values that preserve utility without exposure
+#
+# PII handling strategies:
+#   1. One-way hash (SHA-256) - can still join/aggregate
+#   2. Partial masking (show last 4 digits)
+#   3. Tokenization (reversible with key)
+#   4. Removal (delete field entirely)
+#
+# Compliance: GDPR, CCPA, HIPAA, PCI-DSS
+#
+# Run: expanso-edge run -c 04-mask-pii.yaml
+# =============================================================================
+
+input:
+  generate:
+    count: 100
+    interval: 50ms
+
+pipeline:
+  processors:
+    # Generate data with PII
+    - mapping: |
+        root.id = uuid_v4()
+        root.timestamp = now()
+        root.user = {
+          "name": fake("name"),
+          "email": fake("email"),
+          "phone": fake("phone_number"),
+          "ssn": "123-45-" + random_int(min: 1000, max: 9999).string(),
+          "ip_address": fake("ipv4"),
+          "credit_card": "4111-1111-1111-" + random_int(min: 1000, max: 9999).string()
+        }
+        root.event_type = "purchase"
+        root.amount = random_int(min: 100, max: 10000)
+
+    # ===========================================
+    # FIX 4: Mask all PII fields
+    # ===========================================
+    - mapping: |
+        root.id = this.id
+        root.timestamp = this.timestamp
+        root.event_type = this.event_type
+        root.amount = this.amount
+
+        # Hash email - preserves ability to join/count unique users
+        # Add a salt in production for security
+        let email_hash = this.user.email.lowercase().hash("sha256")
+
+        # Extract domain for analytics (non-PII)
+        let email_domain = this.user.email.split("@").index(1).or("unknown")
+
+        # Partial mask phone - show last 4 digits
+        let phone_masked = "***-***-" + this.user.phone.slice(-4)
+
+        # Full mask SSN - never expose
+        let ssn_masked = "***-**-" + this.user.ssn.slice(-4)
+
+        # Hash IP address - useful for rate limiting, fraud detection
+        let ip_hash = this.user.ip_address.hash("sha256")
+
+        # Mask credit card - PCI compliance
+        let cc_masked = "****-****-****-" + this.user.credit_card.slice(-4)
+
+        # Remove name entirely (or hash if needed for matching)
+        # let name_hash = this.user.name.lowercase().hash("sha256")
+
+        root.user = {
+          "email_hash": $email_hash,
+          "email_domain": $email_domain,
+          "phone_masked": $phone_masked,
+          "ssn_masked": $ssn_masked,
+          "ip_hash": $ip_hash,
+          "credit_card_masked": $cc_masked
+          # name is removed entirely
+        }
+
+        # Add PII processing metadata
+        root._pii = {
+          "masked_at": now(),
+          "fields_masked": ["email", "phone", "ssn", "ip_address", "credit_card", "name"]
+        }
+
+output:
+  stdout:
+    codec: lines

@@ -1,0 +1,145 @@
+# =============================================================================
+# Module 10: Multi-Output Fan-Out
+# =============================================================================
+# FIX: Write to multiple destinations for redundancy and different use cases
+#
+# BEFORE: Single output = single point of failure, no redundancy
+# AFTER:  Multiple outputs with failover for high availability
+#
+# Fan-out patterns:
+#   - fan_out: All outputs receive every message (parallel)
+#   - fan_out_sequential: Sequential delivery with ordering
+#   - round_robin: Distribute load across outputs
+#   - fallback: Try outputs in order until one succeeds
+#
+# Use cases:
+#   - Hot (real-time) + Cold (archive) storage
+#   - Primary + Backup destinations
+#   - Different formats for different consumers
+#   - Regional replication
+#
+# Run: expanso-edge run -c 10-multi-output-fanout.yaml
+# =============================================================================
+
+input:
+  generate:
+    count: 100
+    interval: 50ms
+
+pipeline:
+  processors:
+    # Generate sample data
+    - mapping: |
+        root.id = uuid_v4()
+        root.timestamp = now()
+        root.user = { "email_hash": fake("email").hash("sha256") }
+        root.event_type = ["page_view", "click", "purchase"][random_int(min: 0, max: 2)]
+        root.amount = random_int(min: 1, max: 10000)
+        root.metadata = {
+          "session_id": ksuid(),
+          "source": "web"
+        }
+
+# ===========================================
+# FIX 10: Multi-output with fan-out
+# ===========================================
+output:
+  broker:
+    # fan_out: All outputs receive every message
+    # fan_out_sequential: Ordered delivery
+    # round_robin: Load distribution
+    pattern: fan_out
+    outputs:
+      # Output 1: Real-time stream (hot path)
+      # In production: Kafka, Kinesis, Pub/Sub
+      - stdout:
+          codec: lines
+
+      # Output 2: Archive storage (cold path)
+      # In production: S3, GCS, Azure Blob
+      - file:
+          path: /tmp/bronze-archive-${! timestamp_unix() }.jsonl
+          codec: lines
+
+      # Output 3: Metrics/monitoring
+      # In production: Datadog, Prometheus, CloudWatch
+      # Simulated with log
+      - processors:
+          - mapping: |
+              root = {
+                "metric": "events_processed",
+                "count": 1,
+                "event_type": this.event_type,
+                "timestamp": this.timestamp
+              }
+          - log:
+              level: INFO
+              message: "METRIC: ${! content() }"
+        drop_on: { error: true }
+
+# ===========================================
+# Production example: Full fan-out
+# ===========================================
+# output:
+#   broker:
+#     pattern: fan_out
+#     outputs:
+#       # Primary: Real-time stream
+#       - kafka:
+#           addresses: ["kafka1:9092", "kafka2:9092"]
+#           topic: bronze-events
+#           key: ${! json("id") }
+#           batching:
+#             count: 500
+#             period: 5s
+#
+#       # Secondary: Cold storage archive
+#       - aws_s3:
+#           bucket: bronze-archive
+#           path: "events/${! now().ts_format(\"2006/01/02/15\") }/${! uuid_v4() }.json.gz"
+#           batching:
+#             count: 1000
+#             period: 60s
+#           processors:
+#             - archive:
+#                 format: json_array
+#             - compress:
+#                 algorithm: gzip
+#
+#       # Tertiary: Search/analytics
+#       - elasticsearch:
+#           urls: ["http://es1:9200", "http://es2:9200"]
+#           index: bronze-events-${! now().ts_format("2006.01.02") }
+#           batching:
+#             count: 200
+#             period: 10s
+
+# ===========================================
+# Production example: Failover with fallback
+# ===========================================
+# output:
+#   fallback:
+#     # Try primary first
+#     - kafka:
+#         addresses: ["primary-kafka:9092"]
+#         topic: events
+#
+#     # If primary fails, try secondary
+#     - kafka:
+#         addresses: ["secondary-kafka:9092"]
+#         topic: events
+#       processors:
+#         - mapping: |
+#             root = this
+#             root._failover = {
+#               "reason": meta("fallback_error"),
+#               "failed_at": now()
+#             }
+#
+#     # Last resort: local file
+#     - file:
+#         path: /var/spool/events-fallback.jsonl
+#       processors:
+#         - log:
+#             level: ERROR
+#             message: "All outputs failed, writing to local file"

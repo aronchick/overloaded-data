@@ -1,0 +1,100 @@
+# =============================================================================
+# Module 0: The Problematic Pipeline
+# =============================================================================
+# This pipeline generates HIGH VOLUME data with ALL 10 common mistakes:
+#
+#   1. NO EVENT IDS      - Missing unique identifiers
+#   2. BAD TIMESTAMPS    - Inconsistent formats, nulls, future dates
+#   3. DUPLICATES        - Same events repeated multiple times
+#   4. EXPOSED PII       - Plain text emails, SSNs, phone numbers
+#   5. NO VALIDATION     - Missing fields, wrong types, nulls
+#   6. TEST DATA         - Debug flags and test users mixed in
+#   7. NO BATCHING       - One record at a time
+#   8. NO RATE LIMIT     - Unlimited throughput
+#   9. NO ERROR HANDLING - Bad records will crash downstream
+#  10. SINGLE OUTPUT     - No redundancy or failover
+#
+# Run: expanso-edge run -c 00-problematic-generator.yaml
+# =============================================================================
+
+input:
+  generate:
+    count: 0  # Infinite generation - Ctrl+C to stop
+    interval: 10ms  # ~100 events per second
+
+pipeline:
+  processors:
+    - mapping: |
+        # MISTAKE 1: No consistent event ID (sometimes missing, sometimes weak)
+        root.id = if random_int(min: 0, max: 10) > 3 {
+          # Weak sequential ID - not globally unique
+          "evt-" + random_int(min: 1, max: 1000).string()
+        } else {
+          # Sometimes completely missing!
+          null
+        }
+
+        # MISTAKE 2: Inconsistent timestamps
+        let ts_type = random_int(min: 0, max: 5)
+        root.timestamp = match $ts_type {
+          0 => now(),                                    # ISO 8601 - correct
+          1 => timestamp_unix(),                         # Unix seconds - inconsistent
+          2 => timestamp_unix_milli(),                   # Unix millis - another format!
+          3 => "2024-12-01 14:30:00",                   # Wrong format
+          4 => null,                                     # Missing!
+          _ => "2099-12-31T23:59:59Z"                   # Future date - suspicious
+        }
+
+        # MISTAKE 3: Duplicate events (reuse same data creating duplicates)
+        let is_duplicate = random_int(min: 0, max: 10) < 3  # 30% duplication rate
+        let user_pool = random_int(min: 1, max: 5)  # Only 5 unique users = high collision
+
+        # MISTAKE 4: Exposed PII - no masking!
+        root.user = {
+          "name": fake("name"),
+          "email": fake("email"),                        # Plain text email!
+          "phone": fake("phone_number"),                 # Plain text phone!
+          "ssn": "123-45-" + random_int(min: 1000, max: 9999).string(),  # EXPOSED SSN!
+          "ip_address": fake("ipv4")                     # Could be PII
+        }
+
+        # MISTAKE 5: No schema validation - random missing fields
+        let schema_issue = random_int(min: 0, max: 10)
+        root.event_type = if schema_issue > 2 {
+          ["page_view", "click", "purchase", "signup"][random_int(min: 0, max: 3)]
+        } else {
+          null  # Missing required field!
+        }
+
+        root.amount = if schema_issue != 5 {
+          random_int(min: 1, max: 10000)
+        } else {
+          "not-a-number"  # Wrong type! String instead of int
+        }
+
+        root.metadata = if schema_issue > 4 {
+          {
+            "session_id": ksuid(),
+            "page": "/products/" + random_int(min: 1, max: 100).string()
+          }
+        } else {
+          null  # Missing nested object
+        }
+
+        # MISTAKE 6: Test data mixed with production
+        let is_test = random_int(min: 0, max: 10) < 2  # 20% test data
+        root.environment = if is_test { "test" } else { "production" }
+        root.debug = if is_test { true } else { false }
+        root.test_user = if is_test { true } else { false }
+
+        # Extra fields that vary randomly (schema drift)
+        root.extra = if random_int(min: 0, max: 3) == 0 {
+          { "unexpected_field": "surprise!", "another": random_int(min: 0, max: 100) }
+        } else {
+          deleted()
+        }
+
+output:
+  # MISTAKE 7, 8, 10: No batching, no rate limiting, single output
+  stdout:
+    codec: lines

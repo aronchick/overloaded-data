@@ -1,0 +1,129 @@
+# =============================================================================
+# Module 9: Add Error Handling
+# =============================================================================
+# FIX: Handle errors gracefully with try/catch and dead letter queue
+#
+# BEFORE: Bad records crash entire pipeline, losing good data
+# AFTER:  Bad records routed to DLQ, good records proceed normally
+#
+# Error handling strategies:
+#   1. Try/Catch - Wrap risky operations
+#   2. Dead Letter Queue - Route failures for later analysis
+#   3. Retry with backoff - Transient failure recovery
+#   4. Circuit breaker - Prevent cascade failures
+#   5. Fallback values - Substitute defaults
+#
+# Run: expanso-edge run -c 09-add-error-handling.yaml
+# =============================================================================
+
+cache_resources:
+  - label: dedup_cache
+    memory:
+      default_ttl: 10m
+
+input:
+  generate:
+    count: 100
+    interval: 50ms
+
+pipeline:
+  processors:
+    # Generate data with intentional errors
+    - mapping: |
+        root.id = uuid_v4()
+        root.timestamp = now()
+
+        # Intentionally create problematic data
+        let error_type = random_int(min: 0, max: 10)
+        root.data = match $error_type {
+          0 => "not-valid-json{",           # Invalid JSON
+          1 => null,                         # Null data
+          2 => { "deeply": { "nested": { "value": "found" } } },
+          _ => { "normal": "data", "value": random_int(min: 1, max: 100) }
+        }
+
+        root.user = { "email": fake("email") }
+        root.event_type = ["page_view", "click", "purchase"][random_int(min: 0, max: 2)]
+
+    # ===========================================
+    # FIX 9: Wrap processing in try/catch
+    # ===========================================
+    - try:
+        # Risky operations that might fail
+        - mapping: |
+            root = this
+
+            # Try to access nested data (might fail if structure wrong)
+            root.extracted_value = this.data.deeply.nested.value.or("default")
+
+            # Try to parse data (might fail if not valid)
+            root.data_type = this.data.type()
+
+            # Validate and transform
+            root.processed = if this.data.type() == "object" {
+              this.data
+            } else if this.data.type() == "string" {
+              { "raw": this.data }
+            } else {
+              throw("unsupported data type: " + this.data.type())
+            }
+
+        # Deduplicate (might fail if cache unavailable)
+        - dedupe:
+            cache: dedup_cache
+            key: ${! json("id") }
+
+    # Handle any errors from the try block
+    - catch:
+        # Log the error
+        - log:
+            level: ERROR
+            message: "Processing failed for ${! json(\"id\") }: ${! error() }"
+
+        # Add error metadata for DLQ
+        - mapping: |
+            root = this
+            root._error = {
+              "message": error(),
+              "failed_at": now(),
+              "original_content": content().string()
+            }
+
+        # Route to dead letter queue
+        # In production, this would be a separate output
+        - log:
+            level: WARN
+            message: "Routing to DLQ: ${! json(\"_error\") }"
+
+        # Remove from main flow
+        - mapping: root = deleted()
+
+    # Add success metadata for records that made it through
+    - mapping: |
+        root = this
+        root._processing = {
+          "success": true,
+          "completed_at": now()
+        }
+
+output:
+  stdout:
+    codec: lines
+
+# ===========================================
+# Production: Separate DLQ output
+# ===========================================
+# In production, you'd use a broker with fallback:
+#
+# output:
+#   switch:
+#     cases:
+#       - check: this._error != null
+#         output:
+#           aws_s3:
+#             bucket: my-dlq-bucket
+#             path: "dlq/${! timestamp_unix() }/${! uuid_v4() }.json"
+#       - output:
+#           aws_s3:
+#             bucket: my-bronze-tier
+#             path: "events/${! timestamp_unix() }/${! uuid_v4() }.json"

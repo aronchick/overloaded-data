@@ -1,0 +1,126 @@
+# =============================================================================
+# Module 5: Validate Schema
+# =============================================================================
+# FIX: Validate required fields and data types before storage
+#
+# BEFORE: Missing fields, wrong types, unexpected nulls crash downstream
+# AFTER:  Only valid records proceed; invalid ones go to dead letter queue
+#
+# Validation strategies:
+#   1. Required field checks
+#   2. Data type validation
+#   3. Value range validation
+#   4. Format validation (regex)
+#   5. JSON Schema validation
+#
+# Run: expanso-edge run -c 05-validate-schema.yaml
+# =============================================================================
+
+input:
+  generate:
+    count: 100
+    interval: 50ms
+
+pipeline:
+  processors:
+    # Generate data with schema issues
+    - mapping: |
+        root.id = if random_int(min: 0, max: 10) > 2 { uuid_v4() } else { null }
+        root.timestamp = if random_int(min: 0, max: 10) > 1 { now() } else { null }
+        root.event_type = if random_int(min: 0, max: 10) > 2 {
+          ["page_view", "click", "purchase"][random_int(min: 0, max: 2)]
+        } else {
+          null
+        }
+        root.amount = if random_int(min: 0, max: 10) > 2 {
+          random_int(min: 1, max: 10000)
+        } else if random_int(min: 0, max: 2) == 0 {
+          "not-a-number"  # Wrong type
+        } else {
+          -500  # Invalid negative amount
+        }
+        root.user = if random_int(min: 0, max: 10) > 3 {
+          { "email": fake("email") }
+        } else {
+          null
+        }
+
+    # ===========================================
+    # FIX 5: Validate schema
+    # ===========================================
+    - mapping: |
+        # Initialize validation
+        let errors = []
+
+        # Check required fields
+        let errors = if this.id == null {
+          $errors.append("missing required field: id")
+        } else { $errors }
+
+        let errors = if this.timestamp == null {
+          $errors.append("missing required field: timestamp")
+        } else { $errors }
+
+        let errors = if this.event_type == null {
+          $errors.append("missing required field: event_type")
+        } else { $errors }
+
+        let errors = if this.user == null {
+          $errors.append("missing required field: user")
+        } else { $errors }
+
+        # Validate data types
+        let errors = if this.amount != null && this.amount.type() != "number" {
+          $errors.append("invalid type for amount: expected number, got " + this.amount.type())
+        } else { $errors }
+
+        # Validate value ranges
+        let errors = if this.amount != null && this.amount.type() == "number" && this.amount < 0 {
+          $errors.append("invalid value for amount: must be non-negative")
+        } else { $errors }
+
+        # Validate enum values
+        let valid_event_types = ["page_view", "click", "purchase", "signup", "logout"]
+        let errors = if this.event_type != null && !$valid_event_types.contains(this.event_type) {
+          $errors.append("invalid event_type: " + this.event_type)
+        } else { $errors }
+
+        # Validate nested fields
+        let errors = if this.user != null && this.user.email == null {
+          $errors.append("missing required field: user.email")
+        } else { $errors }
+
+        # Email format validation (simple check)
+        let errors = if this.user != null && this.user.email != null && !this.user.email.contains("@") {
+          $errors.append("invalid email format")
+        } else { $errors }
+
+        # Set validation result
+        root = this
+        root._validation = {
+          "is_valid": $errors.length() == 0,
+          "errors": $errors,
+          "validated_at": now()
+        }
+
+    # Route invalid records
+    - switch:
+        - check: this._validation.is_valid == false
+          processors:
+            - mapping: |
+                # Add DLQ metadata
+                root = this
+                root._dlq = {
+                  "reason": "schema_validation_failed",
+                  "routed_at": now()
+                }
+            # In production, send to DLQ output
+            - log:
+                level: WARN
+                message: "Schema validation failed: ${! json(\"_validation.errors\") }"
+            # Remove from main flow
+            - mapping: root = deleted()
+
+output:
+  stdout:
+    codec: lines

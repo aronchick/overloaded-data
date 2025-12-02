@@ -1,0 +1,87 @@
+# =============================================================================
+# Module 3: Deduplicate Events
+# =============================================================================
+# FIX: Remove duplicate events using cache-based deduplication
+#
+# BEFORE: Same events appear multiple times (retries, network issues, bugs)
+# AFTER:  Each unique event processed exactly once
+#
+# Deduplication strategies:
+#   1. Event ID based (most common)
+#   2. Content hash based (when IDs aren't reliable)
+#   3. Composite key (multiple fields)
+#   4. Time-windowed (within last N minutes)
+#
+# Run: expanso-edge run -c 03-deduplicate-events.yaml
+# =============================================================================
+
+# Define cache for deduplication
+cache_resources:
+  - label: dedup_cache
+    memory:
+      # TTL determines the dedup window
+      # Events with same ID within 10 minutes are considered duplicates
+      default_ttl: 10m
+      # Optional: limit cache size to prevent memory issues
+      # cap: 1000000
+
+input:
+  generate:
+    count: 100
+    interval: 50ms
+
+pipeline:
+  processors:
+    # Generate data with intentional duplicates
+    - mapping: |
+        # Use a small ID pool to create collisions/duplicates
+        let id_pool = random_int(min: 1, max: 20)
+        root.id = "event-" + $id_pool.string()
+        root.timestamp = now()
+        root.user = { "name": fake("name"), "email": fake("email") }
+        root.event_type = ["page_view", "click", "purchase"][random_int(min: 0, max: 2)]
+        root.amount = random_int(min: 1, max: 10000)
+
+    # ===========================================
+    # FIX 3: Deduplicate using cache
+    # ===========================================
+
+    # Method 1: Simple dedupe processor (recommended)
+    - dedupe:
+        cache: dedup_cache
+        key: ${! json("id") }
+        # drop_on_err: true  # Optional: drop if cache fails
+
+    # Add dedup metadata
+    - mapping: |
+        root = this
+        root._dedup = {
+          "processed_at": now(),
+          "is_first_occurrence": true
+        }
+
+    # ===========================================
+    # Alternative: Content-hash based dedup
+    # ===========================================
+    # Useful when IDs aren't reliable or you want to dedupe by content
+    #
+    # - mapping: |
+    #     # Create hash of key fields
+    #     let content_hash = (this.user.email + this.event_type + this.amount.string()).hash("sha256")
+    #     root = this
+    #     root._content_hash = $content_hash
+    #
+    # - dedupe:
+    #     cache: dedup_cache
+    #     key: ${! json("_content_hash") }
+
+    # ===========================================
+    # Alternative: Composite key dedup
+    # ===========================================
+    # - dedupe:
+    #     cache: dedup_cache
+    #     key: ${! json("user.email") + "-" + json("event_type") + "-" + json("timestamp").slice(0, 10) }
+
+output:
+  stdout:
+    codec: lines

@@ -1,0 +1,85 @@
+# =============================================================================
+# Module 8: Add Rate Limiting
+# =============================================================================
+# FIX: Control throughput to prevent overwhelming downstream systems
+#
+# BEFORE: Burst traffic causes cascading failures, dropped data, high costs
+# AFTER:  Controlled, predictable throughput with backpressure
+#
+# Rate limiting strategies:
+#   - Token bucket (smooth rate)
+#   - Fixed window (per interval)
+#   - Sliding window (more accurate)
+#   - Per-key limits (fair sharing)
+#
+# Use cases:
+#   - Protect downstream APIs (rate-limited endpoints)
+#   - Control cloud costs (per-request pricing)
+#   - Prevent storage hotspots
+#   - Fair resource allocation
+#
+# Run: expanso-edge run -c 08-add-rate-limiting.yaml
+# =============================================================================
+
+# ===========================================
+# FIX 8: Define rate limit resources
+# ===========================================
+rate_limit_resources:
+  # Global rate limit: 100 events per second
+  - label: global_rate_limiter
+    local:
+      count: 100
+      interval: 1s
+
+  # Per-user rate limit (for fair sharing)
+  # - label: per_user_limiter
+  #   local:
+  #     count: 10
+  #     interval: 1s
+
+input:
+  generate:
+    count: 1000
+    interval: 1ms  # Trying to generate 1000/sec - will be limited
+
+pipeline:
+  processors:
+    # Generate high-volume data
+    - mapping: |
+        root.id = uuid_v4()
+        root.timestamp = now()
+        root.user_id = "user-" + random_int(min: 1, max: 10).string()
+        root.event_type = ["page_view", "click", "purchase"][random_int(min: 0, max: 2)]
+        root.amount = random_int(min: 1, max: 10000)
+
+    # Apply global rate limit
+    - rate_limit:
+        resource: global_rate_limiter
+
+    # Add rate limit metadata
+    - mapping: |
+        root = this
+        root._throughput = {
+          "rate_limited": true,
+          "max_rate": "100/sec",
+          "processed_at": now()
+        }
+
+    # ===========================================
+    # Alternative: Per-key rate limiting
+    # ===========================================
+    # Useful for multi-tenant systems or fair usage
+    #
+    # - branch:
+    #     request_map: root = this.user_id
+    #     processors:
+    #       - rate_limit:
+    #           resource: per_user_limiter
+    #     result_map: root._rate_limited_user = this
+
+output:
+  stdout:
+    codec: lines
+    batching:
+      count: 100
+      period: 1s

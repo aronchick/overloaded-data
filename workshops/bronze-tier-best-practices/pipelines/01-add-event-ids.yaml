@@ -1,0 +1,70 @@
+# =============================================================================
+# Module 1: Add Event IDs
+# =============================================================================
+# FIX: Ensure every event has a globally unique identifier
+#
+# BEFORE: Events have weak/missing IDs like "evt-123" or null
+# AFTER:  Every event gets a UUID v4 (or UUID v7 for time-ordering)
+#
+# Why UUIDs?
+#   - Globally unique across all systems
+#   - No coordination needed between producers
+#   - UUID v7 adds time-ordering for better indexing
+#
+# Run: expanso-edge run -c 01-add-event-ids.yaml
+# =============================================================================
+
+input:
+  generate:
+    count: 100  # Generate 100 events for demo
+    interval: 50ms
+
+pipeline:
+  processors:
+    # Generate the same problematic data as Module 0
+    - mapping: |
+        root.id = if random_int(min: 0, max: 10) > 3 {
+          "evt-" + random_int(min: 1, max: 1000).string()
+        } else {
+          null
+        }
+        root.timestamp = now()
+        root.user = {
+          "name": fake("name"),
+          "email": fake("email")
+        }
+        root.event_type = ["page_view", "click", "purchase"][random_int(min: 0, max: 2)]
+        root.amount = random_int(min: 1, max: 10000)
+
+    # ===========================================
+    # FIX 1: Add proper event IDs
+    # ===========================================
+    - mapping: |
+        # Preserve original weak ID for debugging
+        root.original_id = this.id
+
+        # Always assign a proper UUID
+        # UUID v4: Random, universally unique
+        root.id = uuid_v4()
+
+        # Alternative: UUID v7 for time-ordered IDs (better for indexing)
+        # root.id = uuid_v7()
+
+        # Alternative: KSUID for sortable, unique IDs
+        # root.id = ksuid()
+
+        # Keep everything else
+        root.timestamp = this.timestamp
+        root.user = this.user
+        root.event_type = this.event_type
+        root.amount = this.amount
+
+        # Add ingestion metadata
+        root._metadata = {
+          "ingested_at": now(),
+          "pipeline_version": "1.0.0"
+        }
+
+output:
+  stdout:
+    codec: lines

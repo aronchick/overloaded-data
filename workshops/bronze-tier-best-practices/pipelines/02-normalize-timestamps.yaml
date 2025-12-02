@@ -1,0 +1,88 @@
+# =============================================================================
+# Module 2: Normalize Timestamps
+# =============================================================================
+# FIX: Convert all timestamp formats to consistent ISO 8601 UTC
+#
+# BEFORE: Mixed formats (Unix, custom strings, nulls, future dates)
+# AFTER:  All timestamps in ISO 8601 format with UTC timezone
+#
+# Common timestamp issues:
+#   - Unix seconds vs milliseconds vs microseconds
+#   - Missing timezone information
+#   - Null or empty values
+#   - Future dates (clock skew or bugs)
+#   - Custom string formats
+#
+# Run: expanso-edge run -c 02-normalize-timestamps.yaml
+# =============================================================================
+
+input:
+  generate:
+    count: 100
+    interval: 50ms
+
+pipeline:
+  processors:
+    # Generate problematic timestamps
+    - mapping: |
+        root.id = uuid_v4()
+        let ts_type = random_int(min: 0, max: 5)
+        root.timestamp = match $ts_type {
+          0 => now(),
+          1 => timestamp_unix(),
+          2 => timestamp_unix_milli(),
+          3 => "2024-12-01 14:30:00",
+          4 => null,
+          _ => "2099-12-31T23:59:59Z"
+        }
+        root.user = { "name": fake("name"), "email": fake("email") }
+        root.event_type = "page_view"
+
+    # ===========================================
+    # FIX 2: Normalize all timestamps
+    # ===========================================
+    - mapping: |
+        # Preserve original for debugging
+        root.original_timestamp = this.timestamp
+        root.timestamp_type = this.timestamp.type()
+
+        # Normalize timestamp to ISO 8601 UTC
+        root.timestamp = match {
+          # Already ISO 8601 string
+          this.timestamp.type() == "string" && this.timestamp.contains("T") =>
+            this.timestamp.ts_parse("2006-01-02T15:04:05Z07:00").catch(now()).ts_format("2006-01-02T15:04:05Z"),
+
+          # Custom format "YYYY-MM-DD HH:MM:SS"
+          this.timestamp.type() == "string" && this.timestamp.contains(" ") =>
+            this.timestamp.ts_parse("2006-01-02 15:04:05").catch(now()).ts_format("2006-01-02T15:04:05Z"),
+
+          # Unix timestamp (seconds) - typically 10 digits
+          this.timestamp.type() == "number" && this.timestamp < 10000000000 =>
+            this.timestamp.ts_unix().ts_format("2006-01-02T15:04:05Z"),
+
+          # Unix timestamp (milliseconds) - typically 13 digits
+          this.timestamp.type() == "number" && this.timestamp >= 10000000000 =>
+            this.timestamp.ts_unix_milli().ts_format("2006-01-02T15:04:05Z"),
+
+          # Null or missing - use current time
+          this.timestamp == null =>
+            now(),
+
+          # Fallback - use current time
+          _ => now()
+        }
+
+        # Validate: reject future timestamps (more than 1 hour ahead)
+        # In real pipeline, you might route these to DLQ instead
+        let parsed = this.timestamp.ts_parse("2006-01-02T15:04:05Z").catch(now())
+        let future_threshold = now().ts_parse("2006-01-02T15:04:05Z07:00")
+        root.is_future = $parsed.ts_unix() > ($future_threshold.ts_unix() + 3600)
+
+        # Copy other fields
+        root.id = this.id
+        root.user = this.user
+        root.event_type = this.event_type
+
+output:
+  stdout:
+    codec: lines
